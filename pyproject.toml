@@ -1,0 +1,16 @@
+[project]
+name = "mlops"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.3.3",
+    "pandas>=2.3.2",
+    "prefect>=3.4.18",
+    "scikit-learn>=1.5.2",
+    "scipy>=1.14.1",
+    "networkx>=3.3",
+    "pymupdf>=1.24.9",
+    "watchdog>=5.0.2",
+]
