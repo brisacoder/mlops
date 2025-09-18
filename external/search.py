@@ -15,16 +15,13 @@ import torch
 from rank_bm25 import BM25Okapi
 from sklearn.preprocessing import normalize as sp_normalize
 from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+import hnswlib
 
+from external.runtime import load_models, SPACY_GPU_ID
 
-# Try optional ANN lib (CPU). If missing, we’ll use NumPy brute-force.
-_HNSW_AVAILABLE = False
-try:
-    import hnswlib
+_HNSW_AVAILABLE = True
 
-    _HNSW_AVAILABLE = True
-except Exception:
-    _HNSW_AVAILABLE = False
 
 # ---- GPU embedder (we reuse your existing external.semantics if present)
 try:
@@ -96,64 +93,64 @@ def _make_queries_logger(artifacts_dir: Path) -> _JsonlLogger:
 def load_runtime(artifacts_dir: str | Path = "./artifacts") -> Dict[str, Any]:
     ART = Path(artifacts_dir)
 
-    # ---- Text indices (TF-IDF / BM25 / chunks)
+    # ---- indices (unchanged) ----
     chunks = json.loads((ART / "chunks.json").read_text(encoding="utf-8"))
     tfidf = pickle.load((ART / "tfidf.pkl").open("rb"))
-    X = pickle.load((ART / "tfidf_X.pkl").open("rb"))  # CSR
+    X = pickle.load((ART / "tfidf_X.pkl").open("rb"))
     X = sp_normalize(X, norm="l2", axis=1, copy=False)
-    bm25: BM25Okapi = pickle.load((ART / "bm25.pkl").open("rb"))
+    bm25 = pickle.load((ART / "bm25.pkl").open("rb"))
     manifest = json.loads((ART / "manifest.json").read_text(encoding="utf-8"))
 
-    # ---- Captions: load/compute embeddings + HNSW
+    # ---- captions embeddings + HNSW (unchanged) ----
     cap_idx = {"files": [], "texts": []}
     cap_embs = np.zeros((0, 384), dtype="float32")
     cap_ann = None
-    cap_idx_path = ART / "caption_index.json"
-    cap_embs_path = ART / "caption_embs.npy"
-    cap_hnsw_path = ART / "hnsw_captions.bin"
-
-    if cap_idx_path.exists():
-        cap_idx = json.loads(cap_idx_path.read_text(encoding="utf-8"))
-        if cap_embs_path.exists():
-            cap_embs = np.load(cap_embs_path)
-        else:
-            # compute & persist
-            cap_embs = embed_texts(cap_idx["texts"])
-            np.save(cap_embs_path, cap_embs)
+    if (ART / "caption_index.json").exists():
+        cap_idx = json.loads((ART / "caption_index.json").read_text(encoding="utf-8"))
+        if (ART / "caption_embs.npy").exists():
+            cap_embs = np.load(ART / "caption_embs.npy")
         if _HNSW_AVAILABLE and cap_embs.shape[0] > 0:
-            cap_ann = _load_or_build_hnsw(cap_embs, cap_hnsw_path)
+            cap_ann = _load_or_build_hnsw(cap_embs, ART / "hnsw_captions.bin")
 
-    # ---- Chunks: load/compute embeddings + HNSW (for candidate gen)
+    # ---- chunk embeddings + HNSW (unchanged) ----
     ch_embs = np.zeros((0, 384), dtype="float32")
     ch_ann = None
-    ch_embs_path = ART / "chunk_embs.npy"
-    ch_hnsw_path = ART / "hnsw_chunks.bin"
+    if (ART / "chunk_embs.npy").exists():
+        ch_embs = np.load(ART / "chunk_embs.npy")
+        if _HNSW_AVAILABLE and ch_embs.shape[0] > 0:
+            ch_ann = _load_or_build_hnsw(ch_embs, ART / "hnsw_chunks.bin")
 
-    if ch_embs_path.exists():
-        ch_embs = np.load(ch_embs_path)
-    else:
-        # embed chunk texts (can be thousands; GPU makes this quick)
-        ch_texts = [c["text"] for c in chunks]
-        ch_embs = embed_texts(ch_texts)
-        np.save(ch_embs_path, ch_embs)
-
-    if _HNSW_AVAILABLE and ch_embs.shape[0] > 0:
-        ch_ann = _load_or_build_hnsw(ch_embs, ch_hnsw_path)
-
-    # ---- spaCy transformers NER (GPU)
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-    spacy.require_gpu()
-    nlp_q = spacy.load(
-        "en_core_web_trf", disable=["tagger", "lemmatizer", "morphologizer", "textcat"]
+    # >>> NEW: preload models via runtime (SINGLE source of truth) <<<
+    loaded = load_models()
+    nlp_q = loaded.nlp
+    st_model = loaded.st_model  # we’ll use this for query embeddings
+    # --- NEW: GPU NER (HF pipeline) for query-time ---
+    hf_ner = pipeline(
+        "token-classification",
+        model="dslim/bert-base-NER",
+        device=SPACY_GPU_ID,  # GPU id, e.g. 0
+        aggregation_strategy="simple",
     )
 
-    # ---- Logger
+    # Build a text-only entity map from the spaCy-built index:  { text -> set(chunk_ids) }
+    ent_text_map = {}
+    ent_path = ART / "entity_index.json"
+    if ent_path.exists():
+        ent_idx = json.loads(ent_path.read_text(encoding="utf-8"))
+        for key, cids in ent_idx.items():
+            txt, _sep, _lbl = key.partition("|")
+            ent_text_map.setdefault(txt, set()).update(cids)
+
+        # small helper so we don’t import another embedder anywhere
+        def _embed_gpu(texts: List[str]) -> np.ndarray:
+            vecs = st_model.encode(
+                texts, normalize_embeddings=True, convert_to_numpy=True, batch_size=256
+            )
+            return vecs.astype("float32")
+
+    # logger
     q_logger = _make_queries_logger(ART)
 
-    # ---- Closure
     def search_fn(q: str, top_k: int = 5) -> Dict[str, Any]:
         t0 = time.perf_counter()
         out = _search_fast(
@@ -169,7 +166,10 @@ def load_runtime(artifacts_dir: str | Path = "./artifacts") -> Dict[str, Any]:
             cap_ann=cap_ann,
             ch_embs=ch_embs,
             ch_ann=ch_ann,
-            nlp_q=nlp_q,
+            # replace spaCy at query-time with HF NER + map
+            hf_ner=hf_ner,
+            ent_text_map=ent_text_map,
+            embed_fn=_embed_gpu,
             ART=ART,
             q_logger=q_logger,
         )
@@ -190,6 +190,7 @@ def load_runtime(artifacts_dir: str | Path = "./artifacts") -> Dict[str, Any]:
         "ch_ann": ch_ann,
         "nlp_q": nlp_q,
         "queries_logger": q_logger,
+        "spacy_query_device": f"cuda:{SPACY_GPU_ID}",
     }
 
 
@@ -235,7 +236,9 @@ def _search_fast(
     cap_ann,
     ch_embs,
     ch_ann,
-    nlp_q,
+    hf_ner,
+    ent_text_map,  # <<< NEW
+    embed_fn,
     ART: Path,
     q_logger: _JsonlLogger,
 ) -> Dict[str, Any]:
@@ -244,9 +247,9 @@ def _search_fast(
 
     # ---- TF-IDF cosine (fast sparse matmul)
     t = time.perf_counter()
-    qv = tfidf.transform([q])  # 1 x vocab
+    qv = tfidf.transform([q])
     qv = sp_normalize(qv, norm="l2", copy=False)
-    sim = qv.dot(X.T).A.ravel()  # 1 x chunks
+    sim = (qv @ X.T).toarray().ravel()
     timings["tfidf_ms"] = _ms(t)
 
     # ---- BM25
@@ -255,10 +258,9 @@ def _search_fast(
     timings["bm25_ms"] = _ms(t)
 
     # ---- Chunk ANN (embed query on GPU; ANN on CPU)
-    cand_embed = set()
     if ch_ann is not None and ch_embs.shape[0] > 0:
         t = time.perf_counter()
-        qch = embed_texts([q]).astype("float32")  # (1, d), normalized
+        qch = embed_fn([q])  # (1, d)
         sims, idxs = _ann_search(ch_ann, qch, CAND_TOPN)
         cand_embed = set(map(int, idxs.tolist()))
         timings["chunk_ann_ms"] = _ms(t)
@@ -271,32 +273,58 @@ def _search_fast(
     idx_bm25 = np.argsort(-bm)[:CAND_TOPN]
     cand = np.array(sorted(set(idx_tfidf).union(set(idx_bm25)).union(cand_embed)))
 
+    if cand.size == 0:
+        # log timing + return empty result instead of crashing
+        try:
+            _make_queries_logger(ART).write(
+                {
+                    "type": "query",
+                    "q": q,
+                    "top_k": top_k,
+                    "tfidf_ms": timings.get("tfidf_ms", 0.0),
+                    "bm25_ms": timings.get("bm25_ms", 0.0),
+                    "chunk_ann_ms": timings.get("chunk_ann_ms", 0.0),
+                    "fusion_ms": 0.0,
+                    "entity_boost_ms": 0.0,
+                    "images_ms": 0.0,
+                    "total_ms": round(sum(timings.values()), 3),
+                    "chosen_chunk_ids": [],
+                    "chosen_pages": [],
+                    "images_selected": 0,
+                    "ann": "hnswlib" if _HNSW_AVAILABLE else "numpy",
+                }
+            )
+        except Exception:
+            pass
+        return {"query": q, "results": []}
+
     sim_n = _minmax(sim[cand])
     bm_n = _minmax(bm[cand])
     base = 0.6 * sim_n + 0.4 * bm_n
     timings["fusion_ms"] = _ms(t)
 
-    # ---- Entity boost (spaCy transformers on GPU)
+    # ---- Entity boost (HF NER on GPU; boost by text only)
     t = time.perf_counter()
-    ent_map = {}
-    ent_path = ART / "entity_index.json"
-    if ent_path.exists():
-        ent_map = json.loads(ent_path.read_text(encoding="utf-8"))
-        doc = nlp_q(q)
-        qents = {f"{e.text.strip().lower()}|{e.label_}" for e in doc.ents}
-        if qents:
-            cid_to_local = {chunks[i]["id"]: j for j, i in enumerate(cand)}
-            boost = np.zeros_like(base)
-            for qe in qents:
-                for cid in ent_map.get(qe, []):
-                    j = cid_to_local.get(cid)
-                    if j is not None:
-                        boost[j] += ENTITY_BOOST
-            score = base + boost
-        else:
+    score = base
+    if ent_text_map:  # only if we have an index
+        try:
+            ner_out = hf_ner(q)  # [{'entity_group':'ORG', 'word':'Ford', ...}, ...]
+            q_texts = {
+                (item.get("word") or "").strip().lower()
+                for item in ner_out
+                if (item.get("word") or "").strip()
+            }
+            if q_texts:
+                cid_to_local = {chunks[i]["id"]: j for j, i in enumerate(cand)}
+                boost = np.zeros_like(base)
+                for txt in q_texts:
+                    for cid in ent_text_map.get(txt, []):
+                        j = cid_to_local.get(cid)
+                        if j is not None:
+                            boost[j] += ENTITY_BOOST
+                score = base + boost
+        except Exception:
             score = base
-    else:
-        score = base
     timings["entity_boost_ms"] = _ms(t)
 
     order_local = np.argsort(-score)[:top_k]
@@ -306,7 +334,7 @@ def _search_fast(
     res = []
     t_img_all = time.perf_counter()
     # Query embedding for captions (GPU)
-    qcap = embed_texts([q]).astype("float32")  # (1, d)
+    qcap = embed_fn([q])
     img_total = 0
     for local_i, i in enumerate(chosen):
         c = chunks[int(i)]
@@ -444,3 +472,26 @@ def _collect_fig_refs(text: str) -> set[str]:
 
 def _ms(t0: float) -> float:
     return round((time.perf_counter() - t0) * 1000.0, 3)
+
+
+# --- Utilities (put near the bottom of search.py) ---
+def _minmax(arr: np.ndarray) -> np.ndarray:
+    if arr.size == 0:
+        return arr
+    a = float(arr.min())
+    b = float(arr.max())
+    if b - a <= 1e-9:
+        return np.zeros_like(arr)
+    return (arr - a) / (b - a)
+
+
+def _ms(t0: float) -> float:
+    return round((time.perf_counter() - t0) * 1000.0, 3)
+
+
+def _tok(s: str) -> List[str]:
+    return re.findall(r"[A-Za-z0-9\-]+", (s or "").lower())
+
+
+def _collect_fig_refs(text: str) -> set[str]:
+    return set(m.group(0).lower() for m in FIG_REF_RX.finditer(text or ""))

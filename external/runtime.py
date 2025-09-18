@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 import time, logging, os
 import torch, spacy
+import cupy  # noqa
+
+# --- SentenceTransformers (GPU if available) ---
+from sentence_transformers import SentenceTransformer
+
+SPACY_GPU_ID = int(os.getenv("SPACY_GPU_ID", "0"))
 
 
 @dataclass
@@ -15,32 +21,53 @@ class Loaded:
     using_gpu: bool
 
 
-def load_models(logger: Optional[logging.Logger] = None) -> Loaded:
-    log = logger or logging.getLogger("runtime")
-    # Torch GPU hint
+# ---- spaCy transformers NER (GPU, *explicitly* pinned)
+def _load_spacy_gpu(gpu_id: int):
+    # 1) Select the exact GPU
+    spacy.require_gpu(gpu_id)
+
+    # 2) Make PyTorch default to the same device (prevents CPU tensors being created)
+    #    Available in torch >= 2.1
     try:
-        torch.set_float32_matmul_precision("high")
+        torch.set_default_device(f"cuda:{gpu_id}")
     except Exception:
         pass
 
-    # --- spaCy transformers (prefer GPU; fall back to CPU if CuPy missing) ---
-    use_gpu = False
-    t0 = time.perf_counter()
-    try:
-        import cupy  # noqa
-
-        spacy.require_gpu()
-        use_gpu = True
-        log.info("spaCy: using GPU (transformers)")
-    except Exception as e:
-        log.info(f"spaCy: GPU not available ({e}); using CPU")
+    # 3) Load the transformer pipeline
     nlp = spacy.load(
-        "en_core_web_trf", disable=["tagger", "lemmatizer", "morphologizer", "textcat"]
+        "en_core_web_trf",
+        disable=["tagger", "lemmatizer", "morphologizer", "textcat"],
     )
-    t_spacy = time.perf_counter() - t0
 
-    # --- SentenceTransformers (GPU if available) ---
-    from sentence_transformers import SentenceTransformer
+    # 4) Force each relevant component to CUDA explicitly
+    #    (curated-transformers exposes .model which is a torch.nn.Module)
+    if "transformer" in nlp.pipe_names:
+        trf = nlp.get_pipe("transformer")
+        try:
+            trf.model.to(f"cuda:{gpu_id}")
+        except Exception:
+            pass
+
+    if "ner" in nlp.pipe_names:
+        ner = nlp.get_pipe("ner")
+        try:
+            ner.model.to(f"cuda:{gpu_id}")
+        except Exception:
+            pass
+
+    return nlp
+
+
+def load_models(logger: Optional[logging.Logger] = None) -> Loaded:
+    log = logger or logging.getLogger("runtime")
+    # Torch GPU hint
+    torch.set_float32_matmul_precision("high")
+
+    # --- spaCy transformers (prefer GPU; fall back to CPU if CuPy missing) ---
+    t0 = time.perf_counter()
+    log.info("spaCy: using GPU (transformers)")
+    nlp = _load_spacy_gpu(SPACY_GPU_ID)
+    t_spacy = time.perf_counter() - t0
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     t1 = time.perf_counter()
