@@ -1,46 +1,52 @@
+# external/chunking.py
 from __future__ import annotations
-from typing import List, Dict, Any
-import re
+
+from typing import Dict, Any, List
 
 
 def split_into_chunks(
-    pages: List[Dict[str, Any]], min_chars=400, max_chars=1200
+    pages: List[Dict[str, Any]],
+    min_chars: int = 400,
+    max_chars: int = 1200,
 ) -> List[Dict[str, Any]]:
-    heading_rx = re.compile(r"^\s*(\d+(\.\d+)*)\s+[A-Z][A-Za-z].{0,80}$")
+    """
+    Greedy, page-aware chunker. Keeps page bounds but merges lines until max_chars.
+    Each chunk: {"id": "cXXXX", "pages": [p,...], "text": "..."}.
+    """
     chunks: List[Dict[str, Any]] = []
-    buf, buf_pages = [], set()
-    cid = 0
+    buf: List[str] = []
+    buf_pages: List[int] = []
 
-    def flush():
-        nonlocal cid, buf, buf_pages, chunks
-        text = "\n".join(buf).strip()
-        if not text:
-            buf.clear()
-            buf_pages.clear()
+    def flush() -> None:
+        if not buf:
             return
-        if len(text) > max_chars:
-            parts = [text[i : i + max_chars] for i in range(0, len(text), max_chars)]
-            for part in parts:
-                cid += 1
-                chunks.append(
-                    {"id": f"C{cid}", "text": part.strip(), "pages": sorted(buf_pages)}
-                )
-        else:
-            cid += 1
-            chunks.append({"id": f"C{cid}", "text": text, "pages": sorted(buf_pages)})
+        cid = f"c{len(chunks):04d}"
+        chunks.append(
+            {
+                "id": cid,
+                "pages": sorted(set(buf_pages)),
+                "text": " ".join(buf).strip(),
+            }
+        )
         buf.clear()
         buf_pages.clear()
 
-    for p in pages:
-        lines = (p["text"] or "").splitlines()
-        for ln in lines:
-            if heading_rx.match(ln) and len("\n".join(buf)) >= min_chars:
+    for pg in pages:
+        text = (pg.get("text") or "").strip()
+        if not text:
+            continue
+        parts = [s.strip() for s in text.splitlines() if s.strip()]
+        for line in parts:
+            candidate = (" ".join(buf + [line])).strip()
+            if len(candidate) > max_chars and len(" ".join(buf)) >= min_chars:
                 flush()
-            buf.append(ln)
-            buf_pages.add(p["page"])
-            if len("\n".join(buf)) >= max_chars:
-                flush()
-        if len("\n".join(buf)) >= (max_chars * 1.5):
+                candidate = line
+            buf.append(line)
+            buf_pages.append(pg["page"])
+        # if page ended and we have a large chunk, consider flushing
+        if len(" ".join(buf)) >= max_chars:
             flush()
-    flush()
+    # tail
+    if buf:
+        flush()
     return chunks

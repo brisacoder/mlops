@@ -1,143 +1,93 @@
+# external/pdf_extract.py
 from __future__ import annotations
 
-import io
-import json
-import os
-import re
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, Any, List, Tuple
 
 import fitz  # PyMuPDF
-from PIL import Image
-
-# Figure/caption patterns: classic "Fig. 5-2" or Ford-style "E416711"
-FIG_RX = re.compile(r"(?:Fig(?:ure)?\.?\s*\d+[A-Za-z\-]*)|(?:^E\d{5,}$)", re.IGNORECASE)
 
 
-def _overlap_1d(a0, a1, b0, b1) -> float:
-    inter = max(0, min(a1, b1) - max(a0, b0))
-    denom = max(1e-6, max(a1 - a0, b1 - b0))
-    return inter / denom
+def _ensure_rgb(pix: "fitz.Pixmap") -> "fitz.Pixmap":
+    """
+    Ensure the pixmap is in an RGB-compatible colorspace so it can be saved as PNG.
+    - If colorspace has >3 components (e.g., CMYK), convert to RGB.
+    - If it's already RGB/Gray (with/without alpha), return as is.
+    """
+    cs = pix.colorspace
+    # If colorspace is None (e.g., indexed) or has up to 3 comps, PNG is OK.
+    if cs is None:
+        return pix
+    n = cs.n  # number of components
+    if n <= 3:
+        return pix
+    # n > 3 (e.g., CMYK): convert
+    return fitz.Pixmap(fitz.csRGB, pix)
 
 
-def _blocks_with_bboxes(page: fitz.Page) -> List[Dict[str, Any]]:
-    d = page.get_text("dict")
-    lines = []
-    for b in d.get("blocks", []):
-        for l in b.get("lines", []):
-            text = "".join([s.get("text", "") for s in l.get("spans", [])]).strip()
-            if not text:
-                continue
-            x0 = min(s["bbox"][0] for s in l["spans"])
-            y0 = min(s["bbox"][1] for s in l["spans"])
-            x1 = max(s["bbox"][2] for s in l["spans"])
-            y1 = max(s["bbox"][3] for s in l["spans"])
-            size = sum(s.get("size", 0) for s in l["spans"]) / max(1, len(l["spans"]))
-            lines.append({"text": text, "bbox": (x0, y0, x1, y1), "size": size})
-    return lines
-
-
-def _nearest_caption_for_image(img_bbox, lines) -> Tuple[str | None, str | None]:
-    x0, y0, x1, y1 = img_bbox
-    best = None
-    best_dy = 1e9
-    figure_id = None
-    for L in lines:
-        tx = L["bbox"]
-        dy = min(abs(tx[1] - y1), abs(y0 - tx[3]))  # below or slightly above
-        if _overlap_1d(x0, x1, tx[0], tx[2]) < 0.3:
-            continue
-        t = L["text"].strip()
-        if len(t) > 180:
-            continue
-        has_fig = bool(FIG_RX.search(t))
-        looks_caption = has_fig or t.endswith(".") or len(t) <= 80
-        if not looks_caption:
-            continue
-        if dy < best_dy:
-            best_dy = dy
-            best = t
-            m = FIG_RX.search(t)
-            figure_id = m.group(0) if m else None
-    return best, figure_id
-
-
-def extract_pdf(pdf_path: Path, out_dir: Path) -> Dict[str, Any]:
+def _save_image(pix: "fitz.Pixmap", out_dir: Path, base: str) -> Tuple[str, int, int]:
+    """
+    Save a PyMuPDF Pixmap to disk as PNG. Returns (filename, width, height).
+    Converts to RGB when needed to avoid 'unsupported colorspace' errors.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    img_dir = out_dir / "images"
-    img_dir.mkdir(parents=True, exist_ok=True)
+    rgb = _ensure_rgb(pix)
+    fname = f"{base}.png"
+    path = out_dir / fname
+    rgb.save(str(path))  # PNG inferred from extension
+    w, h = int(rgb.width), int(rgb.height)
+    # Explicitly drop references to free memory in long loops
+    if rgb is not pix:
+        rgb = None  # noqa: F841
+    return fname, w, h
 
-    # thresholds from env (optional)
-    ICON_MIN_WH = int(os.getenv("ICON_MIN_WH", "48"))
-    ICON_MIN_AREA = int(os.getenv("ICON_MIN_AREA", "16000"))
-    SAVE_AS_JPEG = os.getenv("SAVE_AS_JPEG", "true").lower() == "true"
-    JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
 
-    doc = fitz.open(pdf_path)
-    pages: List[Dict[str, Any]] = []
+def extract_pdf(pdf_path: Path, artifacts_dir: Path) -> Dict[str, Any]:
+    """
+    Extract per-page text and images. Saves images to artifacts_dir/images.
 
-    for pno in range(len(doc)):
-        page = doc[pno]
-        page_text = page.get_text("text") or ""
-        lines = _blocks_with_bboxes(page)
-
-        images_meta = []
-        for i, img in enumerate(page.get_images(full=True)):
-            xref = img[0]
-            info = doc.extract_image(xref)
-            img_bytes = info["image"]
-            try:
-                img_bbox = page.get_image_bbox(xref)
-            except Exception:
-                img_bbox = (0, 0, 0, 0)
-
-            pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-            # skip icons/tiny images
-            if (
-                pil.width < ICON_MIN_WH
-                or pil.height < ICON_MIN_WH
-                or (pil.width * pil.height) < ICON_MIN_AREA
-            ):
-                continue
-
-            base = f"p{pno+1}_{i+1}"
-            if SAVE_AS_JPEG:
-                out_path = img_dir / f"{base}.jpg"
-                pil.save(out_path, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-            else:
-                out_path = img_dir / f"{base}.png"
-                pil.save(out_path, format="PNG")
-
-            caption, fig_id = _nearest_caption_for_image(img_bbox, lines)
-            images_meta.append(
-                {
-                    "file": str(out_path),
-                    "page": pno + 1,
-                    "width": pil.width,
-                    "height": pil.height,
-                    "bbox": img_bbox,
-                    "caption": caption,
-                    "figure_id": fig_id,
-                }
-            )
-
-        pages.append(
-            {
-                "page": pno + 1,
-                "text": page_text,
-                "images": images_meta,
-            }
-        )
-
-    meta = {
-        "pdf_path": str(pdf_path.resolve()),
-        "pages": len(doc),
-        "images_total": sum(len(p["images"]) for p in pages),
+    Manifest format:
+    {
+      "pages": [
+        {"page": 1, "text": "...", "images": [
+           {"file": "page001_im0.png", "page": 1, "width": 1024, "height": 768,
+            "caption": "", "figure_id": ""}, ...
+        ]},
+        ...
+      ]
     }
-    manifest = {"meta": meta, "pages": pages}
+    """
+    images_dir = artifacts_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
 
-    (out_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return manifest
+    pages: List[Dict[str, Any]] = []
+    with fitz.open(pdf_path) as doc:
+        for i, page in enumerate(doc, start=1):
+            text = page.get_text("text") or ""
+            imgs_meta: List[Dict[str, Any]] = []
+            # get_images(full=True) returns a list of tuples; index 0 is xref
+            for j, img in enumerate(page.get_images(full=True)):
+                xref = img[0]
+                base = f"page{i:03d}_im{j}"
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    fname, w, h = _save_image(pix, images_dir, base)
+                    imgs_meta.append(
+                        {
+                            "file": fname,
+                            "page": i,
+                            "width": w,
+                            "height": h,
+                            "caption": "",
+                            "figure_id": "",
+                        }
+                    )
+                finally:
+                    # Make sure pixmap ref is dropped promptly
+                    try:
+                        pix = None  # noqa: F841
+                    except Exception:
+                        pass
+
+            pages.append({"page": i, "text": text, "images": imgs_meta})
+
+    return {"pages": pages}
