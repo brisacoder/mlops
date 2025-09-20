@@ -262,7 +262,7 @@ def process_pdf_chunk_process(chunk_path: Path) -> dict[str, str] | None:
         # Save HTML content to file
         # markdown_output_path = chunk_path.parent / f"{chunk_path.stem}.md"
         json_output_path = chunk_path.parent / f"{chunk_path.stem}.json"
-        # doc.save_as_markdown(markdown_output_path, image_mode=ImageRefMode.EMBEDDED)
+        doc.save_as_markdown(markdown_output_path, image_mode=ImageRefMode.EMBEDDED)
         doc.save_as_json(json_output_path)
         # Return a dictionary with only picklable data
         result_data = {
