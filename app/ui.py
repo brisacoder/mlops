@@ -17,6 +17,7 @@ runtime = load_runtime(ART)
 MIN_IMG_W = int(os.getenv("UI_MIN_IMG_W", "120"))
 MIN_IMG_H = int(os.getenv("UI_MIN_IMG_H", "120"))
 
+
 def _image_ok(img_path: Path) -> bool:
     try:
         with Image.open(img_path) as im:
@@ -24,6 +25,7 @@ def _image_ok(img_path: Path) -> bool:
             return (w >= MIN_IMG_W) and (h >= MIN_IMG_H)
     except Exception:
         return False
+
 
 def respond(q: str, k: int):
     if not q.strip():
@@ -50,8 +52,8 @@ def respond(q: str, k: int):
         return None
 
     md_parts = []
-    gallery_items = []     # list of (path, caption)
-    seen_files = set()     # avoid duplicates across chunks
+    gallery_items = []  # list of (path, caption)
+    seen_files = set()  # avoid duplicates across chunks
 
     for rank, r in enumerate(res["results"], start=1):
         text = (r.get("text") or "").strip()
@@ -96,11 +98,18 @@ def respond(q: str, k: int):
     md = "\n\n".join(md_parts).strip() or "No result text."
     return md, gallery_items
 
+
 with gr.Blocks(title="Car Manual Q&A") as demo:
-    gr.Markdown("## Car Manual Q&A\nAsk questions and get relevant text + images from the manual.")
+    gr.Markdown(
+        "## Car Manual Q&A\nAsk questions and get relevant text + images from the manual."
+    )
     with gr.Row():
         with gr.Column(scale=1):
-            q = gr.Textbox(label="Ask the manual", placeholder="e.g., how do I change the air filter?", lines=2)
+            q = gr.Textbox(
+                label="Ask the manual",
+                placeholder="e.g., how do I change the air filter?",
+                lines=2,
+            )
             k = gr.Slider(label="Top-k chunks", minimum=1, maximum=10, value=5, step=1)
             btn = gr.Button("Search", variant="primary")
         with gr.Column(scale=2):
@@ -108,8 +117,8 @@ with gr.Blocks(title="Car Manual Q&A") as demo:
             gallery = gr.Gallery(
                 label="Images",
                 show_label=True,
-                columns=[3],        # grid
-                height=700,         # tall enough
+                columns=[3],  # grid
+                height=700,  # tall enough
                 object_fit="contain",
                 preview=True,
             )

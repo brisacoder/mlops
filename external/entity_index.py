@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -19,7 +20,6 @@ def build_entity_index(
     Key format: "{text}|{label}". Saves entity_index.json.
     Returns: elapsed seconds (float) for logging.
     """
-    import time
 
     t0 = time.perf_counter()
     nlp_local = nlp or spacy.load("en_core_web_trf")
