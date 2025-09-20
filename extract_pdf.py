@@ -179,7 +179,7 @@ def save_images_tables(conv_res):
                 element.get_image(conv_res.document).save(fp, "PNG")
 
 
-def process_pdf_chunk_process(chunk_path: Path) -> dict[str, str | bool | None] | None:
+def process_pdf_chunk_process(chunk_path: Path) -> dict[str, str] | None:
     """
     Process a single PDF chunk using Docling's advanced document understanding pipeline.
 
@@ -249,8 +249,6 @@ def process_pdf_chunk_process(chunk_path: Path) -> dict[str, str | bool | None] 
         print(f"Converter initialized for {chunk_path}")
     except Exception as e:
         print(f"Converter initialization failed for {chunk_path}: {e}")
-        import traceback
-
         traceback.print_exc()
         return None
 
@@ -262,9 +260,9 @@ def process_pdf_chunk_process(chunk_path: Path) -> dict[str, str | bool | None] 
         doc = conversion_result.document
 
         # Save HTML content to file
-        markdown_output_path = chunk_path.parent / f"{chunk_path.stem}.md"
+        # markdown_output_path = chunk_path.parent / f"{chunk_path.stem}.md"
         json_output_path = chunk_path.parent / f"{chunk_path.stem}.json"
-        doc.save_as_markdown(markdown_output_path, image_mode=ImageRefMode.EMBEDDED)
+        # doc.save_as_markdown(markdown_output_path, image_mode=ImageRefMode.EMBEDDED)
         doc.save_as_json(json_output_path)
         # Return a dictionary with only picklable data
         result_data = {
@@ -272,7 +270,7 @@ def process_pdf_chunk_process(chunk_path: Path) -> dict[str, str | bool | None] 
             "timings": str(
                 conversion_result.timings
             ),  # Convert to string to ensure picklable
-            "markdown_path": str(markdown_output_path),
+            # "markdown_path": str(markdown_output_path),
             "json_path": str(json_output_path)
         }
 
