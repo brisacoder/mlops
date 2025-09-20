@@ -19,19 +19,22 @@ Parallel processing is optimized for both CPU and GPU acceleration while prevent
 resource contention through staggered task submission and worker limits.
 """
 
+import argparse
 import concurrent.futures
 import logging
 import time
+import traceback
 from pathlib import Path
 
 import fitz
-from docling.datamodel.accelerator_options import (AcceleratorDevice,
-                                                   AcceleratorOptions)
+from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.layout_model_specs import DOCLING_LAYOUT_HERON
-from docling.datamodel.pipeline_options import (LayoutOptions,
-                                                PdfPipelineOptions)
+from docling.datamodel.pipeline_options import LayoutOptions, PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling_core.types.doc.base import ImageRefMode
+from docling_core.types.doc.document import PictureItem, TableItem
+import pip
 
 # pylint: disable=logging-fstring-interpolation
 # Using f-strings for logging as preferred by the development team
@@ -79,6 +82,7 @@ def split_pdf_into_chunks(input_pdf_path: Path, num_chunks: int) -> list[Path]:
 
     Raises:
         FileNotFoundError: When the input PDF file cannot be located at the specified path.
+        ValueError: When num_chunks is not a positive integer.
         Exception: For various PDF processing errors including corruption or permission issues.
 
     Example:
@@ -87,11 +91,25 @@ def split_pdf_into_chunks(input_pdf_path: Path, num_chunks: int) -> list[Path]:
         >>> print(f"Created {len(chunks)} chunks")
         Created 4 chunks
     """
+    # Input validation
+    if not isinstance(num_chunks, int) or num_chunks <= 0:
+        raise ValueError(f"num_chunks must be a positive integer, got {num_chunks}")
+
+    if not input_pdf_path.exists():
+        raise FileNotFoundError(f"Input PDF not found: {input_pdf_path}")
+
     temp_chunk_paths = []
 
     try:
-        input_doc = fitz.open(input_pdf_path)
+        input_doc = fitz.open(str(input_pdf_path))
         total_pages = input_doc.page_count
+
+        # Additional validation
+        if total_pages == 0:
+            print("Warning: PDF has no pages")
+            input_doc.close()
+            return []
+
         pages_per_chunk = total_pages // num_chunks
         remaining_pages = total_pages % num_chunks
 
@@ -115,7 +133,7 @@ def split_pdf_into_chunks(input_pdf_path: Path, num_chunks: int) -> list[Path]:
             temp_chunk_paths.append(temp_chunk_path)
 
             # Save the temporary chunk document
-            chunk_doc.save(temp_chunk_path)
+            chunk_doc.save(str(temp_chunk_path))
 
             # Close the temporary chunk document
             chunk_doc.close()
@@ -131,15 +149,37 @@ def split_pdf_into_chunks(input_pdf_path: Path, num_chunks: int) -> list[Path]:
 
         return temp_chunk_paths
 
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError, OSError):
         print(f"Error: Input PDF not found at {input_pdf_path}")
         return []
-    except Exception as e:
+    except (ValueError, RuntimeError) as e:
         print(f"An error occurred during PDF splitting: {e}")
         return []
 
 
-def process_pdf_chunk_process(chunk_path: str):
+def save_images_tables(conv_res):
+    # Save images of figures and tables
+    table_counter = 0
+    picture_counter = 0
+    for element, _level in conv_res.document.iterate_items():
+        if isinstance(element, TableItem):
+            table_counter += 1
+            element_image_filename = (
+                output_dir / f"{doc_filename}-table-{table_counter}.png"
+            )
+            with element_image_filename.open("wb") as fp:
+                element.get_image(conv_res.document).save(fp, "PNG")
+
+        if isinstance(element, PictureItem):
+            picture_counter += 1
+            element_image_filename = (
+                output_dir / f"{doc_filename}-picture-{picture_counter}.png"
+            )
+            with element_image_filename.open("wb") as fp:
+                element.get_image(conv_res.document).save(fp, "PNG")
+
+
+def process_pdf_chunk_process(chunk_path: Path) -> dict[str, str | bool | None] | None:
     """
     Process a single PDF chunk using Docling's advanced document understanding pipeline.
 
@@ -159,7 +199,7 @@ def process_pdf_chunk_process(chunk_path: str):
     best practices for multiprocessing including proper resource isolation and cleanup.
 
     Args:
-        chunk_path (str): File system path to the PDF chunk file to be processed.
+        chunk_path (Path): File system path to the PDF chunk file to be processed.
             Should point to a valid PDF document created by the chunking process.
 
     Returns:
@@ -185,15 +225,16 @@ def process_pdf_chunk_process(chunk_path: str):
     # Initialize converter with minimal options to avoid memory issues
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = False
-    pipeline_options.do_table_structure = False  # Keep disabled for stability
+    pipeline_options.do_table_structure = True  # Keep disabled for stability
     pipeline_options.generate_page_images = False
-    pipeline_options.generate_picture_images = True  # Keep disabled for stability
-    pipeline_options.generate_parsed_pages = False
+    pipeline_options.generate_picture_images = True
+    pipeline_options.generate_parsed_pages = True
+    pipeline_options.images_scale = 2.0
     pipeline_options.layout_options = LayoutOptions(
         model_spec=DOCLING_LAYOUT_HERON,
     )
     pipeline_options.accelerator_options = AcceleratorOptions(
-        num_threads=6, device=AcceleratorDevice.CUDA
+        num_threads=NUM_THREADS, device=AcceleratorDevice.CUDA
     )
 
     print(f"Initializing converter for {chunk_path}")
@@ -209,45 +250,35 @@ def process_pdf_chunk_process(chunk_path: str):
     except Exception as e:
         print(f"Converter initialization failed for {chunk_path}: {e}")
         import traceback
+
         traceback.print_exc()
         return None
 
     try:
-        conversion_result = converter.convert(chunk_path)
+        conversion_result = converter.convert(str(chunk_path))
         print(f"Successfully processed chunk: {chunk_path}")
-        
+
         # Extract picklable data from the result
         doc = conversion_result.document
-        markdown_content = doc.export_to_markdown()
-        html_content = doc.export_to_html()
-        
+
         # Save HTML content to file
-        chunk_path_obj = Path(chunk_path)
-        html_output_path = chunk_path_obj.parent / f"{chunk_path_obj.stem}.html"
-        try:
-            with open(html_output_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            html_success = True
-            log.info(f"HTML file saved: {html_output_path}")
-        except Exception as e:
-            log.error(f"Failed to save HTML file: {e}")
-            html_success = False
-        
+        markdown_output_path = chunk_path.parent / f"{chunk_path.stem}.md"
+        json_output_path = chunk_path.parent / f"{chunk_path.stem}.json"
+        doc.save_as_markdown(markdown_output_path, image_mode=ImageRefMode.EMBEDDED)
+        doc.save_as_json(json_output_path)
         # Return a dictionary with only picklable data
         result_data = {
-            'chunk_path': chunk_path,
-            'markdown': markdown_content,
-            'timings': str(conversion_result.timings),  # Convert to string to ensure picklable
-            'html_generated': html_success,
-            'html_path': str(html_output_path) if html_success else None
+            "chunk_path": str(chunk_path),
+            "timings": str(
+                conversion_result.timings
+            ),  # Convert to string to ensure picklable
+            "markdown_path": str(markdown_output_path),
+            "json_path": str(json_output_path)
         }
-        
-        return result_data
-    except Exception as e:
-        log.error(f"Error processing chunk {chunk_path}: {e}")
-        import traceback
 
-        traceback.print_exc()
+        return result_data
+    except (ValueError, RuntimeError, OSError) as e:
+        log.error(f"Error processing chunk {chunk_path}: {e}")
         return None
 
 
@@ -259,6 +290,15 @@ def main():
     a sophisticated parallel processing strategy that maximizes throughput while maintaining
     system stability. The pipeline integrates intelligent chunking, resource-aware parallel
     execution, and comprehensive result aggregation.
+
+    Command Line Usage:
+        python extract_pdf.py [OPTIONS]
+
+    Options:
+        -p, --pdf-path PATH    Path to input PDF file (default: ./data/kona.pdf)
+        -c, --chunks INT       Number of chunks to split PDF into (default: 6)
+        -v, --verbose          Enable verbose logging
+        -h, --help            Show help message
 
     Processing Strategy:
     1. Model preloading to avoid redundant downloads in subprocesses
@@ -280,7 +320,7 @@ def main():
     - Provides detailed timing and success metrics
 
     Args:
-        None: Configuration is handled through module-level constants and file paths.
+        None: Configuration is handled through command line arguments.
 
     Returns:
         None: Results are logged and stored in memory. Future enhancements may
@@ -298,59 +338,126 @@ def main():
         - Adequate system memory for parallel processing
         - Compatible hardware acceleration (CPU/GPU) for ML models
 
-    Example:
-        >>> main()
-        Preloading models in main process...
-        Models preloaded.
-        Split 552 pages into 6 chunks.
-        Processing 6 chunks with ProcessPoolExecutor...
-        Parallel processing of 6 chunks took 45.23 seconds.
-        Results: 6 successful out of 6
+    Examples:
+        # Use default settings
+        python extract_pdf.py
+
+        # Process custom PDF with 8 chunks
+        python extract_pdf.py -p /path/to/document.pdf -c 8
+
+        # Enable verbose logging
+        python extract_pdf.py -v
+
+        # Show help
+        python extract_pdf.py --help
     """
 
-    data_folder = Path("./data")
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Process PDF documents with parallel chunking and Docling",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python extract_pdf.py                          # Use default PDF: ./data/kona.pdf
+  python extract_pdf.py -p /path/to/document.pdf # Specify custom PDF path
+  python extract_pdf.py --pdf-path ./myfile.pdf  # Use long option
+        """,
+    )
+
+    parser.add_argument(
+        "-p",
+        "--pdf-path",
+        type=str,
+        default="./data/kona.pdf",
+        help="Path to the input PDF file (default: ./data/kona.pdf)",
+    )
+
+    parser.add_argument(
+        "-c",
+        "--chunks",
+        type=int,
+        default=DEFAULT_NUM_CHUNKS,
+        help=f"Number of chunks to split the PDF into (default: {DEFAULT_NUM_CHUNKS})",
+    )
+
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose logging"
+    )
+
+    args = parser.parse_args()
+
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("docling").setLevel(logging.DEBUG)
+        logging.getLogger("docling_core").setLevel(logging.DEBUG)
+
+    # Convert string path to Path object
+    input_pdf_path = Path(args.pdf_path)
+
+    # Validate input file exists
+    if not input_pdf_path.exists():
+        log.error(f"Input PDF file not found: {input_pdf_path}")
+        return
+
+    # Validate input file is actually a PDF
+    if input_pdf_path.suffix.lower() != ".pdf":
+        log.error(f"Input file must be a PDF file: {input_pdf_path}")
+        return
+
+    # Validate chunks argument
+    if args.chunks <= 0:
+        log.error(f"Number of chunks must be positive: {args.chunks}")
+        return
+
+    log.info(f"Processing PDF: {input_pdf_path}")
+    log.info(f"Number of chunks: {args.chunks}")
 
     # Define the number of chunks for sequential processing
-    num_chunks = 6  # Adjust as needed for optimal sequential processing
-
-    # Define the input PDF file path (assuming data_folder is defined)
-    input_pdf_path = data_folder / "kona.pdf"
+    num_chunks = args.chunks
 
     # Split the PDF into chunks
     temp_chunk_paths = split_pdf_into_chunks(input_pdf_path, num_chunks)
 
     # Try ProcessPoolExecutor with careful resource management
     if temp_chunk_paths:
-        log.info(f"\nProcessing {len(temp_chunk_paths)} chunks with ProcessPoolExecutor...")
+        log.info(
+            f"\nProcessing {len(temp_chunk_paths)} chunks with ProcessPoolExecutor..."
+        )
         start_time = time.time()
 
         # Use ProcessPoolExecutor with limited workers
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=min(num_chunks, 2)
-        ) as executor:  # Limit to 2 workers max
+            max_workers=min(num_chunks, MAX_WORKERS)
+        ) as executor:  # Limit to MAX_WORKERS max
             # Submit processing tasks with staggered start to avoid resource contention
             future_to_chunk = {}
             for i, chunk_path in enumerate(temp_chunk_paths):
                 if i > 0:
-                    time.sleep(5)  # 5 second delay between submissions
-                future = executor.submit(process_pdf_chunk_process, str(chunk_path))
+                    time.sleep(
+                        STAGGER_DELAY
+                    )  # STAGGER_DELAY second delay between submissions
+                future = executor.submit(process_pdf_chunk_process, chunk_path)
                 future_to_chunk[future] = chunk_path
 
             parallel_results = {}
             for future in concurrent.futures.as_completed(future_to_chunk):
                 chunk_path = future_to_chunk[future]
                 try:
-                    result = future.result(timeout=600)  # 10 minute timeout per chunk
+                    result = future.result(
+                        timeout=TIMEOUT_PER_CHUNK
+                    )  # TIMEOUT_PER_CHUNK minute timeout per chunk
                     if result is not None:
                         parallel_results[chunk_path] = result
                         log.info(f"Processed {chunk_path}")
                     else:
                         log.warning(f"Failed to process {chunk_path}")
                 except concurrent.futures.TimeoutError:
-                    log.error(f"{chunk_path} timed out after 10 minutes")
+                    log.error(
+                        f"{chunk_path} timed out after {TIMEOUT_PER_CHUNK} seconds"
+                    )
                 except (RuntimeError, ValueError, OSError) as exc:
                     log.error(f"{chunk_path} generated an exception: {exc}")
-                    import traceback
                     traceback.print_exc()
 
         end_time = time.time()
@@ -366,10 +473,11 @@ def main():
     else:
         log.warning("No chunks were created for processing.")
 
+
 # Remember to clean up temporary files after you are done
 # for chunk_path in temp_chunk_paths:
 #     if chunk_path.exists():
-#         os.remove(chunk_path)
+#         chunk_path.unlink()
 #         print(f"Cleaned up: {chunk_path}")
 
 
