@@ -209,7 +209,6 @@ def process_pdf_chunk_process(chunk_path: str):
     except Exception as e:
         print(f"Converter initialization failed for {chunk_path}: {e}")
         import traceback
-
         traceback.print_exc()
         return None
 
@@ -220,7 +219,7 @@ def process_pdf_chunk_process(chunk_path: str):
         # Extract picklable data from the result
         doc = conversion_result.document
         markdown_content = doc.export_to_markdown()
-        html_content = doc.export_to_html(image_mode="embedded")
+        html_content = doc.export_to_html()
         
         # Save HTML content to file
         chunk_path_obj = Path(chunk_path)
@@ -351,6 +350,7 @@ def main():
                     log.error(f"{chunk_path} timed out after 10 minutes")
                 except (RuntimeError, ValueError, OSError) as exc:
                     log.error(f"{chunk_path} generated an exception: {exc}")
+                    import traceback
                     traceback.print_exc()
 
         end_time = time.time()
